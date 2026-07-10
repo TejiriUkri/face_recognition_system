@@ -1,6 +1,9 @@
 import os
 import base64
 import cv2
+import json
+import traceback
+import urllib.request
 import numpy as np
 import face_recognition
 import mysql.connector
@@ -9,158 +12,240 @@ from flask_cors import CORS
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
-# This is the "2026 Standard" for allowing local development requests
+# Allows cross-origin requests for local development environments
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
-
-# --- GLOBAL CACHE ---
-KNOWN_ENCODINGS = []
-KNOWN_NAMES = []
-KNOWN_IDS = []
 
 def get_db_connection():
     return mysql.connector.connect(
         host="localhost",
         user="root",
         password="",
-        database="attendance_system"
+        database="attendan_office_attendance"
     )
 
-def load_attendance_cache():
-    """Pre-loads all student face math into RAM for instant matching."""
-    global KNOWN_ENCODINGS, KNOWN_NAMES, KNOWN_IDS
-    KNOWN_ENCODINGS, KNOWN_NAMES, KNOWN_IDS = [], [], []
-    
-    print("--- CACHING DATABASE: PLEASE WAIT ---")
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name, photo_blob FROM students")
-    
-    for (id, name, blob) in cursor.fetchall():
-        nparr = np.frombuffer(blob, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is not None:
-            rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            encodings = face_recognition.face_encodings(rgb_img)
-            if encodings:
-                KNOWN_ENCODINGS.append(encodings[0])
-                KNOWN_NAMES.append(name)
-                KNOWN_IDS.append(id)
-    
-    conn.close()
-    print(f"--- SUCCESS: {len(KNOWN_NAMES)} STUDENTS LOADED ---")
+def get_network_or_local_time():
+    """
+    Attempts to fetch the authentic date/time from an online API.
+    Falls back gracefully to the local system time if offline.
+    """
+    try:
+        # Using a reliable, public time API
+        url = "http://worldtimeapi.org/api/ip"
+        with urllib.request.urlopen(url, timeout=3) as response:
+            data = json.loads(response.read().decode())
+            # Extract standard ISO timestamp up to seconds characters: YYYY-MM-DDTHH:MM:SS
+            dt_str = data['datetime'][:19]
+            now = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S")
+            print(f"DEBUG: Successfully synchronized time via Network API: {now}")
+            return now, now.date()
+    except Exception as e:
+        print(f"DEBUG: Network time sync failed ({e}). Defaulting to local system time.")
+        now = datetime.now()
+        return now, now.date()
 
-# LOAD CACHE ON STARTUP
-load_attendance_cache()
 
 @app.route('/verify', methods=['POST'])
 def verify():
+    conn = None
+    cursor = None
     try:
         data = request.get_json()
-        header, encoded = data['image'].split(",", 1)
-        image_data = base64.b64decode(encoded)
-        
-        # Process Live Image
+        incoming_admin_id = data.get('admin_id')
+        base64_string = data.get('image', '')
+
+        if not base64_string:
+            return jsonify({"status": "failed", "message": "No image data received"}), 400
+
+        # 1. Strip the HTML Data URL header if present
+        if "," in base64_string:
+            base64_string = base64_string.split(",")[1]
+
+        # 2. Decode base64 to image matrix
+        image_data = base64.b64decode(base64_string)
         nparr = np.frombuffer(image_data, np.uint8)
         live_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if live_img is None:
+            return jsonify({"status": "failed", "message": "Invalid image format"}), 400
+            
         live_rgb = cv2.cvtColor(live_img, cv2.COLOR_BGR2RGB)
 
-        # Detect Face
+        # 3. Downscale and Extract Facial Vectors
         small_frame = cv2.resize(live_rgb, (0, 0), fx=0.25, fy=0.25)
         live_encodings = face_recognition.face_encodings(small_frame, model="hog")
         
         if not live_encodings:
-            return jsonify({"status": "failed", "message": "No face detected"})
+            return jsonify({"status": "failed", "message": "No face detected in frame"})
+        
+        live_encoding = live_encodings[0]
 
-        # FAST COMPARISON (Uses vector math instead of a loop)
-        if KNOWN_ENCODINGS:
-            # face_distance returns a list of distances for ALL students at once
-            distances = face_recognition.face_distance(KNOWN_ENCODINGS, live_encodings[0])
-            best_match_index = np.argmin(distances)
-            
+        # 4. Tenant-Isolated Database Query
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        
+        print(f"DEBUG: Looking for faces belonging to Admin ID: {incoming_admin_id}")
 
-            # STRICTOR THRESHOLD: 0.4 ensures high accuracy for schools
-            if distances[best_match_index] < 0.42:
-                name = KNOWN_NAMES[best_match_index]
-                user_id = KNOWN_IDS[best_match_index]
-                print(f"MATCH: {name} (Score: {distances[best_match_index]:.4f})")
+        query = """
+            SELECT f.user_id, f.full_name, f.face_encoding 
+            FROM face_registeration f
+            JOIN companies c ON f.company_id = c.id
+            WHERE c.user_id = %s
+        """
+        cursor.execute(query, (incoming_admin_id,))
+        records = cursor.fetchall()
+        
+        if not records:
+            return jsonify({"status": "error", "message": "No registered records found for this company view."})
+
+        # Parse DB data into explicit parallel arrays
+        company_encodings = []
+        company_names = []
+        company_ids = []
+
+        for record in records:
+            db_string = record['face_encoding']
+            if not db_string:
+                continue
                 
-            
-                try:
-                    conn = get_db_connection()
-                    cursor = conn.cursor(dictionary=True)
-                    
-                    # 1. FETCH ADMIN SETTING
-                    cursor.execute("SELECT setting_value FROM system_settings WHERE setting_key = 'min_checkout_gap'")
-                    settings = cursor.fetchone()
-                    gap_minutes = settings['setting_value'] if settings else 30 # Fallback to 30
-
-                    today = datetime.now().date()
-                    now = datetime.now()
-
-                    cursor.execute("SELECT * FROM attendance WHERE student_id = %s AND date = %s", (user_id, today))
-                    record = cursor.fetchone()
-                    print(f"DEBUG: Attempting to log ID: {user_id}, Name: {name}, Date: {today}")
-                    if not record:
-                        # ACTION: SIGN IN
-                        print(f"DEBUG: Attempting to log ID: {user_id}, Name: {name}, Date: {today}")
-                        cursor.execute(
-                            "INSERT INTO attendance (student_id, student_name, date, time_in, status) VALUES (%s, %s, %s, %s, 'IN')",
-                            (user_id, name, today, now.strftime('%H:%M:%S'))
-                        )
-                        message = f"Welcome, {name}! Signed In."
-                        status_type = "success"
-                    
-                    elif record['status'] == 'IN':
-                        # 2. CHECK AGAINST ADMIN TIME LIMIT
-                        time_in = datetime.combine(today, (datetime.min + record['time_in']).time())
-                        allowed_out_time = time_in + timedelta(minutes=gap_minutes)
-
-                        if now >= allowed_out_time:
-                            cursor.execute(
-                                "UPDATE attendance SET time_out = %s, status = 'OUT' WHERE id = %s",
-                                (now.strftime('%H:%M:%S'), record['id'])
-                            )
-                            message = f"Goodbye, {name}! Signed Out."
-                            status_type = "success"
-                        else:
-                            # Calculate remaining minutes for better UX
-                            remaining = int((allowed_out_time - now).total_seconds() / 60)
-                            message = f"Already In. Checkout available in {remaining} mins."
-                            status_type = "info"
-                    
-                    else:
-                        message = "Attendance complete for today."
-                        status_type = "info"
-
-                    conn.commit()
-                    
+            try:
+                # FORMAT 1: Saved as JSON array string
+                if db_string.startswith('['):
+                    encoding_math = np.array(json.loads(db_string))
+                # FORMAT 2: Saved as flat raw text/binary
+                else:
+                    encoding_bytes = db_string.encode('latin-1')
+                    encoding_math = np.frombuffer(encoding_bytes, dtype=np.float64)
                 
-                except mysql.connector.Error as db_err:
-                    # This prints the SPECIFIC MySQL error to your terminal
-                    print(f"CRITICAL DATABASE ERROR: {db_err}")
-                        
-                except Exception as e:
-                    # This prints any other Python error (like logic or math errors)
-                    print(f"GENERAL PYTHON ERROR: {e}")
+                company_encodings.append(encoding_math)
+                company_names.append(record['full_name'])
+                company_ids.append(record['user_id'])
+            except Exception as parse_err:
+                print(f"DEBUG: Skipping broken encoding for row ID {record.get('user_id')}: {parse_err}")
 
-                finally:
-                    if 'conn' in locals() and conn.is_connected():
-                        cursor.close()
-                        conn.close()            
-                        # return jsonify({"status": status_type, "name": name, "message": message})
-                        return jsonify({"status": "success", "name": name, "id": user_id})
+        print(f"DEBUG: Evaluated {len(company_encodings)} face profiles.")
+        if len(company_encodings) == 0:
+            return jsonify({"status": "error", "message": "No valid face signatures ready for analysis."})
 
-        return jsonify({"status": "failed", "message": "Unknown face"})
+        # 5. Vector Distance Matching Engine
+        distances = face_recognition.face_distance(company_encodings, live_encoding)
+        best_match_index = np.argmin(distances)
+        lowest_distance = distances[best_match_index]
+        
+        print(f"DEBUG: System closest distance score matching: {lowest_distance:.4f}")
+
+        # Strict precision check (0.42 threshold filters out false metrics effectively)
+        if lowest_distance < 0.42:
+            name = company_names[best_match_index]
+            user_id = company_ids[best_match_index]
+            print(f"MATCH IDENTIFIED: {name} (Score: {lowest_distance:.4f})")
+            
+            # Fetch network time or local clock fallback
+            now, today = get_network_or_local_time()
+
+            # Fetch Configured Checkout Buffer settings
+            cursor.execute("SELECT setting_value FROM system_settings WHERE setting_key = 'min_checkout_gap'")
+            settings = cursor.fetchone()
+            gap_minutes = int(settings['setting_value']) if settings else 30
+
+            # Audit Check for matching existing daily row entries
+            cursor.execute("SELECT * FROM attendance WHERE userid = %s AND log_date = %s", (user_id, today))
+            attendance_record = cursor.fetchone()
+
+            if not attendance_record:
+                # Action: Perform Check-In
+                cursor.execute(
+                    "INSERT INTO attendance (userid, log_date, time_clock_in, status) VALUES (%s, %s, %s, 'IN')",
+                    (user_id, today, now.strftime('%H:%M:%S'))
+                )
+                message = f"Welcome, {name}! Signed In."
+                status_type = "success"
+            
+            elif attendance_record['status'] == 'IN':
+                # Convert MySQL standard TIME object representation to standard Python datetime
+                time_in = datetime.combine(today, (datetime.min + attendance_record['time_clock_in']).time())
+                allowed_out_time = time_in + timedelta(minutes=gap_minutes)
+
+                if now >= allowed_out_time:
+                    # Action: Perform Check-Out
+                    cursor.execute(
+                        "UPDATE attendance SET time_clock_out = %s, status = 'OUT' WHERE id = %s",
+                        (now.strftime('%H:%M:%S'), attendance_record['id'])
+                    )
+                    message = f"Goodbye, {name}! Signed Out."
+                    status_type = "success"
+                else:
+                    remaining_minutes = int((allowed_out_time - now).total_seconds() / 60)
+                    message = f"Already Clocked In. Checkout available in {remaining_minutes} mins."
+                    status_type = "info"
+            
+            else:
+                message = "Attendance logs complete for today."
+                status_type = "info"
+
+            conn.commit()
+            return jsonify({
+                "status": status_type, 
+                "name": name, 
+                "id": user_id, 
+                "message": message
+            })
+        
+        else:
+            print("DEBUG: Distance exceeds recognition limit.")
+            return jsonify({"status": "failed", "message": "Unknown face signature"})
+
+    except mysql.connector.Error as db_err:
+        print(f"CRITICAL DATABASE ERROR: {db_err}")
+        return jsonify({"status": "error", "message": "Database interaction error occurring"}), 500
+    except Exception as e:
+        print("=== CRASH REPORT ===")
+        traceback.print_exc()
+        print("====================")
+        return jsonify({"status": "error", "message": "Internal processing engine crash"}), 500
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+            print("DEBUG: Database connection safely returned to pool.")
+
+
+@app.route('/calculate_encoding', methods=['POST'])
+def calculate_encoding():
+    data = request.json or {}
+    base64_string = data.get('image')
+
+    if not base64_string:
+        return jsonify({"error": "No image provided"}), 400
+
+    try:
+        if "," in base64_string:
+            base64_string = base64_string.split(",")[1]
+            
+        img_data = base64.b64decode(base64_string)
+        nparr = np.frombuffer(img_data, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if img is None:
+            return jsonify({"error": "Failed to read image content"}), 400
+            
+        rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        face_locations = face_recognition.face_locations(rgb_img)
+        
+        if len(face_locations) == 0:
+            return jsonify({"error": "No face found in image"}), 400
+            
+        face_encoding = face_recognition.face_encodings(rgb_img, face_locations)[0]
+        return jsonify({"success": True, "encoding": face_encoding.tolist()})
 
     except Exception as e:
-        print(f"Server Error: {e}")
-        return jsonify({"status": "error", "message": "Internal server error"}), 500
+        return jsonify({"error": str(e)}), 500
 
-# Add a route to refresh the cache if you add new students
+
 @app.route('/refresh', methods=['GET'])
 def refresh():
-    load_attendance_cache()
-    return jsonify({"status": "success", "message": "Cache updated"})
+    return jsonify({"status": "success", "message": "Cache logic bypassed for real-time isolation queries"})
+
 
 if __name__ == '__main__':
-    app.run(debug=False, port=5000) # Debug=False is faster and more stable
+    # Running directly with debug=False avoids launching secondary monitoring threads
+    app.run(debug=False, host='0.0.0.0', port=5000)
